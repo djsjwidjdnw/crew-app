@@ -16,16 +16,22 @@ class _SplashScreenState extends State<SplashScreen> {
   }
 
   Future<void> _redirect() async {
-    await Future.delayed(const Duration(seconds: 2));
+    // Wait for Supabase to initialize
+    await Future.delayed(const Duration(milliseconds: 500));
 
     if (!mounted) return;
 
-    final session = Supabase.instance.client.auth.currentSession;
+    try {
+      final session = Supabase.instance.client.auth.currentSession;
 
-    if (session != null) {
-      Navigator.pushReplacementNamed(context, '/home');
-    } else {
-      Navigator.pushReplacementNamed(context, '/login');
+      if (session != null) {
+        Navigator.pushReplacementNamed(context, '/home');
+      } else {
+        Navigator.pushReplacementNamed(context, '/login');
+      }
+    } catch (e) {
+      // If anything goes wrong, go to login
+      if (mounted) Navigator.pushReplacementNamed(context, '/login');
     }
   }
 
@@ -37,7 +43,6 @@ class _SplashScreenState extends State<SplashScreen> {
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            // Logo
             Container(
               width: 100,
               height: 100,

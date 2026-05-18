@@ -40,11 +40,8 @@ class _ProfileScreenState extends State<ProfileScreen> {
       _role = userRes?['role'];
       final profileRes = await Supabase.instance.client.from('profiles').select().eq('user_id', userId).maybeSingle();
       _profile = profileRes;
-
-      // Load real certifications
       final certRes = await Supabase.instance.client.from('certifications').select().eq('user_id', userId).order('created_at');
       _certifications = (certRes as List).cast<Map<String, dynamic>>();
-
       await _loadCrewHistory(userId);
     } catch (e) { debugPrint('Error loading profile: $e'); }
     setState(() => _loading = false);
@@ -66,6 +63,29 @@ class _ProfileScreenState extends State<ProfileScreen> {
       }
       _crewHistory = history;
     } catch (e) { _crewHistory = []; }
+  }
+
+  Future<void> _uploadProfilePhoto() async {
+    try {
+      final picker = ImagePicker();
+      final picked = await picker.pickImage(source: ImageSource.gallery, maxWidth: 800, imageQuality: 80);
+      if (picked == null) return;
+
+      final userId = Supabase.instance.client.auth.currentUser?.id;
+      if (userId == null) return;
+
+      final fileName = '${userId}_${DateTime.now().millisecondsSinceEpoch}.jpg';
+      final bytes = await picked.readAsBytes();
+
+      await Supabase.instance.client.storage.from('profile-photos').uploadBinary(fileName, bytes, fileOptions: const FileOptions(contentType: 'image/jpeg', upsert: true));
+      final url = Supabase.instance.client.storage.from('profile-photos').getPublicUrl(fileName);
+
+      await Supabase.instance.client.from('profiles').update({'profile_photo_url': url}).eq('user_id', userId);
+      await _loadProfile();
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Profile photo updated!'), backgroundColor: Color(0xFF22c55e)));
+    } catch (e) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Upload error: $e'), backgroundColor: const Color(0xFFef4444)));
+    }
   }
 
   void _startEditing() {
@@ -125,10 +145,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
           final userId = Supabase.instance.client.auth.currentUser?.id;
           if (userId == null) return;
           try {
-            await Supabase.instance.client.from('certifications').insert({
-              'user_id': userId, 'name': nameCtrl.text.trim(),
-              'expiry_date': expiry?.toIso8601String().split('T')[0], 'status': 'pending',
-            });
+            await Supabase.instance.client.from('certifications').insert({'user_id': userId, 'name': nameCtrl.text.trim(), 'expiry_date': expiry?.toIso8601String().split('T')[0], 'status': 'pending'});
             Navigator.pop(ctx);
             _loadProfile();
             if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Certification added!'), backgroundColor: Color(0xFF22c55e)));
@@ -143,14 +160,11 @@ class _ProfileScreenState extends State<ProfileScreen> {
       final picker = ImagePicker();
       final picked = await picker.pickImage(source: ImageSource.gallery, maxWidth: 1200);
       if (picked == null) return;
-
       final userId = Supabase.instance.client.auth.currentUser?.id;
       final fileName = '${userId}_${certId}_${DateTime.now().millisecondsSinceEpoch}.jpg';
       final bytes = await picked.readAsBytes();
-
       await Supabase.instance.client.storage.from('certifications').uploadBinary(fileName, bytes, fileOptions: const FileOptions(contentType: 'image/jpeg'));
       final url = Supabase.instance.client.storage.from('certifications').getPublicUrl(fileName);
-
       await Supabase.instance.client.from('certifications').update({'photo_url': url}).eq('id', certId);
       _loadProfile();
       if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Photo uploaded!'), backgroundColor: Color(0xFF22c55e)));
@@ -170,10 +184,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
   }
 
   Future<void> _deleteCert(String certId) async {
-    try {
-      await Supabase.instance.client.from('certifications').delete().eq('id', certId);
-      _loadProfile();
-    } catch (e) {}
+    try { await Supabase.instance.client.from('certifications').delete().eq('id', certId); _loadProfile(); } catch (e) {}
   }
 
   void _showEndorsementDialog(Map<String, dynamic> person) {
@@ -195,6 +206,60 @@ class _ProfileScreenState extends State<ProfileScreen> {
 
   @override
   void dispose() { _nameController.dispose(); _phoneController.dispose(); _locationController.dispose(); _bioController.dispose(); _yearsController.dispose(); super.dispose(); }
+
+  Widget _buildProfilePhoto() {
+    final photoUrl = _profile?['profile_photo_url'];
+    return GestureDetector(
+      onTap: _uploadProfilePhoto,
+      child: Stack(children: [
+        Container(
+          width: 100, height: 100,
+          decoration: BoxDecoration(
+            color: const Color(0xFF1E3A5F), shape: BoxShape.circle,
+            border: Border.all(color: const Color(0xFFFF6B35), width: 3),
+            image: photoUrl != null && photoUrl.toString().isNotEmpty
+                ? DecorationImage(image: NetworkImage(photoUrl), fit: BoxFit.cover)
+                : null,
+          ),
+          child: photoUrl == null || photoUrl.toString().isEmpty
+              ? const Icon(Icons.person, color: Color(0xFFFF6B35), size: 52)
+              : null,
+        ),
+        Positioned(bottom: 0, right: 0, child: Container(
+          width: 32, height: 32,
+          decoration: const BoxDecoration(color: Color(0xFFFF6B35), shape: BoxShape.circle),
+          child: const Icon(Icons.camera_alt, color: Colors.white, size: 16),
+        )),
+      ]),
+    );
+  }
+
+  Widget _buildEditProfilePhoto() {
+    final photoUrl = _profile?['profile_photo_url'];
+    return GestureDetector(
+      onTap: _uploadProfilePhoto,
+      child: Stack(children: [
+        Container(
+          width: 90, height: 90,
+          decoration: BoxDecoration(
+            color: const Color(0xFF1E3A5F), shape: BoxShape.circle,
+            border: Border.all(color: const Color(0xFFFF6B35), width: 3),
+            image: photoUrl != null && photoUrl.toString().isNotEmpty
+                ? DecorationImage(image: NetworkImage(photoUrl), fit: BoxFit.cover)
+                : null,
+          ),
+          child: photoUrl == null || photoUrl.toString().isEmpty
+              ? const Icon(Icons.person, color: Color(0xFFFF6B35), size: 48)
+              : null,
+        ),
+        Positioned(bottom: 0, right: 0, child: Container(
+          width: 30, height: 30,
+          decoration: const BoxDecoration(color: Color(0xFFFF6B35), shape: BoxShape.circle),
+          child: const Icon(Icons.camera_alt, color: Colors.white, size: 14),
+        )),
+      ]),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -218,16 +283,11 @@ class _ProfileScreenState extends State<ProfileScreen> {
     final yearsInField = _profile?['years_in_field'] ?? 0;
 
     return SingleChildScrollView(padding: const EdgeInsets.all(20), child: Column(children: [
-      // Header
       Container(width: double.infinity, decoration: BoxDecoration(color: const Color(0xFF111827), borderRadius: BorderRadius.circular(16), border: Border.all(color: const Color(0xFF1e2d45))),
         child: Column(children: [
           Container(width: double.infinity, padding: const EdgeInsets.symmetric(vertical: 28), decoration: const BoxDecoration(color: Color(0xFF1a2235), borderRadius: BorderRadius.vertical(top: Radius.circular(16))),
             child: Column(children: [
-              Stack(children: [
-                Container(width: 100, height: 100, decoration: BoxDecoration(color: const Color(0xFF1E3A5F), shape: BoxShape.circle, border: Border.all(color: const Color(0xFFFF6B35), width: 3)), child: const Icon(Icons.person, color: Color(0xFFFF6B35), size: 52)),
-                Positioned(bottom: 0, right: 0, child: Container(width: 32, height: 32, decoration: const BoxDecoration(color: Color(0xFFFF6B35), shape: BoxShape.circle),
-                  child: IconButton(icon: const Icon(Icons.camera_alt, color: Colors.white, size: 16), padding: EdgeInsets.zero, onPressed: () { ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Profile photo coming soon!'), backgroundColor: Color(0xFFFF6B35))); }))),
-              ]),
+              _buildProfilePhoto(),
               const SizedBox(height: 14), Text(name, style: const TextStyle(color: Color(0xFFF0F4FF), fontSize: 22, fontWeight: FontWeight.w700)),
               const SizedBox(height: 6),
               Container(padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4), decoration: BoxDecoration(color: _role == 'journeyman' ? const Color(0xFF1E3A5F) : const Color(0xFFFF6B35).withOpacity(0.2), borderRadius: BorderRadius.circular(4)),
@@ -249,7 +309,6 @@ class _ProfileScreenState extends State<ProfileScreen> {
       SizedBox(width: double.infinity, child: ElevatedButton.icon(onPressed: _startEditing, icon: const Icon(Icons.edit, size: 18), label: const Text('EDIT PROFILE'))),
       const SizedBox(height: 16),
 
-      // Stats
       Container(width: double.infinity, decoration: BoxDecoration(color: const Color(0xFF111827), borderRadius: BorderRadius.circular(12), border: Border.all(color: const Color(0xFF1e2d45))), padding: const EdgeInsets.all(16),
         child: Row(mainAxisAlignment: MainAxisAlignment.spaceAround, children: [
           _statItem('${_certifications.length}', 'Certs'), Container(width: 1, height: 40, color: const Color(0xFF1e2d45)),
@@ -259,7 +318,6 @@ class _ProfileScreenState extends State<ProfileScreen> {
 
       const SizedBox(height: 16),
 
-      // Crew History
       _sectionCard(_role == 'journeyman' ? 'CREW I\'VE HIRED' : 'PEOPLE I\'VE WORKED FOR', Icons.group,
         _crewHistory.isEmpty ? [const Text('No crew history yet.', style: TextStyle(color: Color(0xFF8896b0), fontSize: 13))]
         : _crewHistory.map((p) => Padding(padding: const EdgeInsets.symmetric(vertical: 6), child: Container(width: double.infinity, padding: const EdgeInsets.all(12), decoration: BoxDecoration(color: const Color(0xFF0A0E1A), borderRadius: BorderRadius.circular(8), border: Border.all(color: const Color(0xFF1e2d45))),
@@ -283,7 +341,6 @@ class _ProfileScreenState extends State<ProfileScreen> {
 
       const SizedBox(height: 12),
 
-      // Certifications (real data)
       _sectionCard('MY CERTIFICATIONS', Icons.verified, [
         ..._certifications.map((c) => Padding(padding: const EdgeInsets.symmetric(vertical: 6), child: Container(
           width: double.infinity, padding: const EdgeInsets.all(10), decoration: BoxDecoration(color: const Color(0xFF0A0E1A), borderRadius: BorderRadius.circular(8), border: Border.all(color: const Color(0xFF1e2d45))),
@@ -310,10 +367,9 @@ class _ProfileScreenState extends State<ProfileScreen> {
 
   Widget _buildEditMode() {
     return SingleChildScrollView(padding: const EdgeInsets.all(20), child: Column(children: [
-      Center(child: Stack(children: [
-        Container(width: 90, height: 90, decoration: BoxDecoration(color: const Color(0xFF1E3A5F), shape: BoxShape.circle, border: Border.all(color: const Color(0xFFFF6B35), width: 3)), child: const Icon(Icons.person, color: Color(0xFFFF6B35), size: 48)),
-        Positioned(bottom: 0, right: 0, child: Container(width: 30, height: 30, decoration: const BoxDecoration(color: Color(0xFFFF6B35), shape: BoxShape.circle), child: const Icon(Icons.camera_alt, color: Colors.white, size: 14))),
-      ])),
+      Center(child: _buildEditProfilePhoto()),
+      const SizedBox(height: 6),
+      const Text('Tap photo to change', style: TextStyle(color: Color(0xFF8896b0), fontSize: 11)),
       const SizedBox(height: 24),
       _buildField('Full Name', _nameController),
       _buildField('Phone', _phoneController, type: TextInputType.phone),
