@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(flutter *)",
+      "PowerShell(if \\(Test-Path \"build\\\\web\\\\main.dart.js\"\\) { Write-Output \"BUILD_OK: $\\(Get-Item build\\\\web\\\\main.dart.js | Select-Object -ExpandProperty Length\\) bytes\"; Get-ChildItem build\\\\web\\\\index.html | Format-List Name, LastWriteTime, Length } else { Write-Output \"BUILD_MISSING\" })",
+      "Bash(git *)"
+    ]
+  }
+}
