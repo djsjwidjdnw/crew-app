@@ -60,7 +60,7 @@ class _JobDetailScreenState extends State<JobDetailScreen> {
     final duration = widget.job['duration_days'];
     final experience = widget.job['experience_required'] ?? 'any';
     String expLabel = experience;
-    switch (experience) { case 'any': expLabel = 'Any Level'; break; case 'apprentice': expLabel = 'Apprentice'; break; case 'journeyman': expLabel = 'Journeyman'; break; case 'master': expLabel = 'Master'; break; }
+    switch (experience) { case 'any': expLabel = 'Any Level'; break; case 'apprentice': expLabel = 'Apprentice'; break; case 'journeyman': expLabel = 'Journeyman'; break; case 'master': expLabel = 'Journeyman'; break; }
 
     return Scaffold(
       appBar: AppBar(title: const Text('JOB DETAILS'), leading: IconButton(icon: const Icon(Icons.arrow_back), onPressed: () => Navigator.pop(context))),
@@ -125,7 +125,7 @@ class _JobDetailScreenState extends State<JobDetailScreen> {
               _sec('TYPICAL REQUIREMENTS', Icons.assignment, [
                 _ri('CSTS-2020 (Construction Safety Training)'), _ri('H2S Alive Certificate'), _ri('Fall Protection Training'),
                 _ri('Valid government-issued ID'), _ri('Steel-toed boots and basic PPE'),
-                if (expLabel == 'Journeyman' || expLabel == 'Master') _ri('Journeyman or Master ticket'),
+                if (expLabel == 'Journeyman') _ri('Journeyman ticket'),
               ]),
               const SizedBox(height: 32),
             ])),

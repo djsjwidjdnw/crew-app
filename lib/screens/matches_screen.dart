@@ -203,7 +203,7 @@ class _MatchesScreenState extends State<MatchesScreen> with SingleTickerProvider
           case 'apprentice_3rd': expLabel = '3rd Year'; break;
           case 'apprentice_4th': expLabel = '4th Year'; break;
           case 'journeyman': expLabel = 'Journeyman'; break;
-          case 'master': expLabel = 'Master'; break;
+          case 'master': expLabel = 'Journeyman'; break;
         }
 
         return GestureDetector(
@@ -313,7 +313,7 @@ class _MatchesScreenState extends State<MatchesScreen> with SingleTickerProvider
           case 'any': expLabel = 'Any Level'; break;
           case 'apprentice': expLabel = 'Apprentice'; break;
           case 'journeyman': expLabel = 'Journeyman'; break;
-          case 'master': expLabel = 'Master'; break;
+          case 'master': expLabel = 'Journeyman'; break;
         }
 
         return Container(
