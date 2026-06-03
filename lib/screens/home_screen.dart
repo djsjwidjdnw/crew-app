@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+import '../crew_constants.dart';
+import '../error_helper.dart';
 import 'swipe_screen.dart';
 import 'matches_screen.dart';
 import 'profile_screen.dart';
@@ -24,33 +26,38 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _loadRole() async {
-    try {
-      final userId = Supabase.instance.client.auth.currentUser?.id;
-      if (userId == null) {
-        setState(() => _loading = false);
-        return;
-      }
+    final userId = Supabase.instance.client.auth.currentUser?.id;
+    if (userId == null) {
+      if (!mounted) return;
+      Navigator.pushReplacementNamed(context, '/login');
+      return;
+    }
 
+    try {
       final res = await Supabase.instance.client
           .from('users')
           .select('role')
           .eq('id', userId)
           .maybeSingle();
 
+      if (!mounted) return;
       setState(() {
-        _role = res?['role'] ?? 'helper';
+        _role = res?['role'] ?? CrewConstants.roleHelper;
         _loading = false;
       });
     } catch (e) {
+      if (!mounted) return;
+      // Keep a safe default so the app still works, but surface the error.
       setState(() {
-        _role = 'helper';
+        _role = CrewConstants.roleHelper;
         _loading = false;
       });
+      AppFeedback.showError(context, e);
     }
   }
 
   List<Widget> _getScreens() {
-    if (_role == 'journeyman') {
+    if (_role == CrewConstants.roleJourneyman) {
       return [
         const SwipeScreen(mode: 'people'),
         JobPostScreen(),
@@ -68,7 +75,7 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   List<BottomNavigationBarItem> _getNavItems() {
-    if (_role == 'journeyman') {
+    if (_role == CrewConstants.roleJourneyman) {
       return const [
         BottomNavigationBarItem(
           icon: Icon(Icons.swipe),
@@ -114,7 +121,7 @@ class _HomeScreenState extends State<HomeScreen> {
     if (_loading) {
       return const Scaffold(
         body: Center(
-          child: CircularProgressIndicator(color: Color(0xFFFF6B35)),
+          child: CircularProgressIndicator(color: CrewConstants.primary),
         ),
       );
     }
@@ -130,16 +137,16 @@ class _HomeScreenState extends State<HomeScreen> {
       bottomNavigationBar: Container(
         decoration: const BoxDecoration(
           border: Border(
-            top: BorderSide(color: Color(0xFF1e2d45), width: 1),
+            top: BorderSide(color: CrewConstants.border, width: 1),
           ),
         ),
         child: BottomNavigationBar(
           currentIndex: _currentIndex,
           onTap: (index) => setState(() => _currentIndex = index),
           type: BottomNavigationBarType.fixed,
-          backgroundColor: const Color(0xFF111827),
-          selectedItemColor: const Color(0xFFFF6B35),
-          unselectedItemColor: const Color(0xFF8896b0),
+          backgroundColor: CrewConstants.surface,
+          selectedItemColor: CrewConstants.primary,
+          unselectedItemColor: CrewConstants.textSecondary,
           elevation: 0,
           items: navItems,
         ),

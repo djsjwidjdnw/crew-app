@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
+import '../crew_constants.dart';
+
 class SplashScreen extends StatefulWidget {
   const SplashScreen({super.key});
 
@@ -16,7 +18,7 @@ class _SplashScreenState extends State<SplashScreen> {
   }
 
   Future<void> _redirect() async {
-    // Wait for Supabase to initialize
+    // Wait for Supabase to initialize.
     await Future.delayed(const Duration(milliseconds: 500));
 
     if (!mounted) return;
@@ -29,16 +31,18 @@ class _SplashScreenState extends State<SplashScreen> {
       } else {
         Navigator.pushReplacementNamed(context, '/login');
       }
-    } catch (e) {
-      // If anything goes wrong, go to login
-      if (mounted) Navigator.pushReplacementNamed(context, '/login');
+    } catch (_) {
+      // If anything goes wrong, fall back to login so the user can retry.
+      // We cannot surface a snackbar before a Scaffold exists, so just route.
+      if (!mounted) return;
+      Navigator.pushReplacementNamed(context, '/login');
     }
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: const Color(0xFF0A0E1A),
+      backgroundColor: CrewConstants.background,
       body: Center(
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
@@ -47,15 +51,15 @@ class _SplashScreenState extends State<SplashScreen> {
               width: 100,
               height: 100,
               decoration: BoxDecoration(
-                color: const Color(0xFF111827),
+                color: CrewConstants.surface,
                 borderRadius: BorderRadius.circular(24),
-                border: Border.all(color: const Color(0xFF1e2d45), width: 1),
+                border: Border.all(color: CrewConstants.border, width: 1),
               ),
               child: const Center(
                 child: Text(
                   'C',
                   style: TextStyle(
-                    color: Color(0xFFFF6B35),
+                    color: CrewConstants.primary,
                     fontSize: 56,
                     fontWeight: FontWeight.w800,
                     letterSpacing: -2,
@@ -67,7 +71,7 @@ class _SplashScreenState extends State<SplashScreen> {
             const Text(
               'CREW',
               style: TextStyle(
-                color: Color(0xFFF0F4FF),
+                color: CrewConstants.textPrimary,
                 fontSize: 36,
                 fontWeight: FontWeight.w800,
                 letterSpacing: 8,
@@ -77,7 +81,7 @@ class _SplashScreenState extends State<SplashScreen> {
             const Text(
               'FIND YOUR CREW',
               style: TextStyle(
-                color: Color(0xFF8896b0),
+                color: CrewConstants.textSecondary,
                 fontSize: 12,
                 letterSpacing: 4,
               ),
@@ -87,7 +91,7 @@ class _SplashScreenState extends State<SplashScreen> {
               width: 24,
               height: 24,
               child: CircularProgressIndicator(
-                color: Color(0xFFFF6B35),
+                color: CrewConstants.primary,
                 strokeWidth: 2,
               ),
             ),

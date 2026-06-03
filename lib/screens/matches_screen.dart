@@ -1,6 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+import '../crew_constants.dart';
+import '../error_helper.dart';
 import 'chat_screen.dart';
+import 'job_detail_screen.dart';
 
 class MatchesScreen extends StatefulWidget {
   const MatchesScreen({super.key});
@@ -38,6 +41,7 @@ class _MatchesScreenState extends State<MatchesScreen> with SingleTickerProvider
 
     _userId = Supabase.instance.client.auth.currentUser?.id;
     if (_userId == null) {
+      if (!mounted) return;
       setState(() {
         _loading = false;
         _error = 'Not logged in';
@@ -47,76 +51,97 @@ class _MatchesScreenState extends State<MatchesScreen> with SingleTickerProvider
 
     try {
       await Future.wait([_loadPeopleMatches(), _loadJobMatches()]);
+      if (!mounted) return;
+      setState(() => _loading = false);
     } catch (e) {
-      _error = 'Error loading matches: $e';
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _error = 'Error loading matches';
+      });
+      AppFeedback.showError(context, e);
     }
-    setState(() => _loading = false);
   }
 
   Future<void> _loadPeopleMatches() async {
-    try {
-      final res = await Supabase.instance.client
-          .from('matches')
-          .select('id, journeyman_id, helper_id, matched_at')
-          .or('journeyman_id.eq.$_userId,helper_id.eq.$_userId')
-          .order('matched_at', ascending: false);
+    final res = await Supabase.instance.client
+        .from('matches')
+        .select('id, journeyman_id, helper_id, matched_at')
+        .or('journeyman_id.eq.$_userId,helper_id.eq.$_userId')
+        .order('matched_at', ascending: false);
 
-      final matches = (res as List).cast<Map<String, dynamic>>();
-      List<Map<String, dynamic>> enriched = [];
-
-      for (final match in matches) {
-        final otherId = match['journeyman_id'] == _userId
-            ? match['helper_id']
-            : match['journeyman_id'];
-
-        final userRes = await Supabase.instance.client
-            .from('users')
-            .select('id, email, role, profiles(full_name, location_text, experience_level)')
-            .eq('id', otherId)
-            .maybeSingle();
-
-        if (userRes != null) {
-          enriched.add({
-            'match_id': match['id'],
-            'matched_at': match['matched_at'],
-            'user': userRes,
-          });
-        }
-      }
-
-      _peopleMatches = enriched;
-    } catch (e) {
-      debugPrint('Error loading people matches: $e');
+    final matches = (res as List).cast<Map<String, dynamic>>();
+    if (matches.isEmpty) {
       _peopleMatches = [];
+      return;
     }
+
+    // Collect the "other" user id for each match (de-duplicated).
+    final otherIds = <String>{};
+    for (final match in matches) {
+      final otherId = match['journeyman_id'] == _userId
+          ? match['helper_id']
+          : match['journeyman_id'];
+      if (otherId != null) otherIds.add(otherId.toString());
+    }
+
+    if (otherIds.isEmpty) {
+      _peopleMatches = [];
+      return;
+    }
+
+    // Single query for all the "other" users instead of one-per-row.
+    final usersRes = await Supabase.instance.client
+        .from('users')
+        .select(
+            'id, email, role, profiles(full_name, location_text, experience_level, trade_type, availability_status)')
+        .inFilter('id', otherIds.toList());
+
+    final usersById = <String, Map<String, dynamic>>{};
+    for (final u in (usersRes as List).cast<Map<String, dynamic>>()) {
+      usersById[u['id'].toString()] = u;
+    }
+
+    final enriched = <Map<String, dynamic>>[];
+    for (final match in matches) {
+      final otherId = match['journeyman_id'] == _userId
+          ? match['helper_id']
+          : match['journeyman_id'];
+      if (otherId == null) continue;
+      final user = usersById[otherId.toString()];
+      if (user == null) continue;
+      enriched.add({
+        'match_id': match['id'],
+        'matched_at': match['matched_at'],
+        'user': user,
+      });
+    }
+
+    _peopleMatches = enriched;
   }
 
   Future<void> _loadJobMatches() async {
-    try {
-      final likedRes = await Supabase.instance.client
-          .from('job_swipes')
-          .select('job_id')
-          .eq('user_id', _userId!)
-          .eq('liked', true);
+    final likedRes = await Supabase.instance.client
+        .from('job_swipes')
+        .select('job_id')
+        .eq('user_id', _userId!)
+        .eq('liked', true);
 
-      final likedJobIds = (likedRes as List).map((s) => s['job_id']).toList();
+    final likedJobIds = (likedRes as List).map((s) => s['job_id']).toList();
 
-      if (likedJobIds.isEmpty) {
-        _jobMatches = [];
-        return;
-      }
-
-      final jobsRes = await Supabase.instance.client
-          .from('jobs')
-          .select('id, title, description, location_text, hourly_rate, experience_required, duration_days, journeyman_id')
-          .inFilter('id', likedJobIds)
-          .eq('is_active', true);
-
-      _jobMatches = (jobsRes as List).cast<Map<String, dynamic>>();
-    } catch (e) {
-      debugPrint('Error loading job matches: $e');
+    if (likedJobIds.isEmpty) {
       _jobMatches = [];
+      return;
     }
+
+    final jobsRes = await Supabase.instance.client
+        .from('jobs')
+        .select(
+            'id, title, description, location_text, hourly_rate, experience_required, duration_days, journeyman_id')
+        .inFilter('id', likedJobIds)
+        .eq('is_active', true);
+
+    _jobMatches = (jobsRes as List).cast<Map<String, dynamic>>();
   }
 
   void _openChat(String matchId, String otherUserName, String otherUserRole) {
@@ -128,6 +153,15 @@ class _MatchesScreenState extends State<MatchesScreen> with SingleTickerProvider
           otherUserName: otherUserName,
           otherUserRole: otherUserRole,
         ),
+      ),
+    ).then((_) => _loadAll());
+  }
+
+  void _openJob(Map<String, dynamic> job) {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => JobDetailScreen(job: job),
       ),
     ).then((_) => _loadAll());
   }
@@ -178,199 +212,218 @@ class _MatchesScreenState extends State<MatchesScreen> with SingleTickerProvider
   }
 
   Widget _buildPeopleTab() {
-    if (_peopleMatches.isEmpty) {
-      return _buildEmpty('🤝', 'No people matches yet', 'Start swiping to find your crew');
-    }
+    return RefreshIndicator(
+      onRefresh: _loadAll,
+      color: CrewConstants.primary,
+      child: _peopleMatches.isEmpty
+          ? _buildEmptyScrollable('🤝', 'No people matches yet', 'Start swiping to find your crew')
+          : ListView.separated(
+              physics: const AlwaysScrollableScrollPhysics(),
+              padding: const EdgeInsets.all(16),
+              itemCount: _peopleMatches.length,
+              separatorBuilder: (_, __) => const SizedBox(height: 8),
+              itemBuilder: (context, index) {
+                final match = _peopleMatches[index];
+                final matchId = match['match_id'].toString();
+                final user = match['user'] as Map<String, dynamic>;
+                final profile = user['profiles'] as Map<String, dynamic>?;
+                final name = profile?['full_name'] ?? user['email'] ?? 'Unknown';
+                final location = profile?['location_text'] ?? '';
+                final role = user['role'] ?? '';
+                final experience = profile?['experience_level'] ?? '';
+                final expLabel = experience.isEmpty
+                    ? ''
+                    : CrewConstants.expToLabel(experience);
+                final availability =
+                    profile?['availability_status'] as String?;
+                final availShort =
+                    CrewConstants.availabilityShortLabel(availability);
 
-    return ListView.separated(
-      padding: const EdgeInsets.all(16),
-      itemCount: _peopleMatches.length,
-      separatorBuilder: (_, __) => const SizedBox(height: 8),
-      itemBuilder: (context, index) {
-        final match = _peopleMatches[index];
-        final matchId = match['match_id'].toString();
-        final user = match['user'] as Map<String, dynamic>;
-        final profile = user['profiles'] as Map<String, dynamic>?;
-        final name = profile?['full_name'] ?? user['email'] ?? 'Unknown';
-        final location = profile?['location_text'] ?? '';
-        final role = user['role'] ?? '';
-        final experience = profile?['experience_level'] ?? '';
-
-        String expLabel = experience;
-        switch (experience) {
-          case 'apprentice_1st': expLabel = '1st Year'; break;
-          case 'apprentice_2nd': expLabel = '2nd Year'; break;
-          case 'apprentice_3rd': expLabel = '3rd Year'; break;
-          case 'apprentice_4th': expLabel = '4th Year'; break;
-          case 'journeyman': expLabel = 'Journeyman'; break;
-          case 'master': expLabel = 'Journeyman'; break;
-        }
-
-        return GestureDetector(
-          onTap: () => _openChat(matchId, name, role),
-          child: Container(
-            decoration: BoxDecoration(
-              color: const Color(0xFF111827),
-              borderRadius: BorderRadius.circular(12),
-              border: Border.all(color: const Color(0xFF1e2d45)),
-            ),
-            padding: const EdgeInsets.all(16),
-            child: Row(
-              children: [
-                Container(
-                  width: 52,
-                  height: 52,
-                  decoration: BoxDecoration(
-                    color: const Color(0xFF1E3A5F),
-                    shape: BoxShape.circle,
-                    border: Border.all(color: const Color(0xFFFF6B35), width: 2),
-                  ),
-                  child: const Icon(Icons.person, color: Color(0xFFFF6B35), size: 28),
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        name,
-                        style: const TextStyle(
-                          color: Color(0xFFF0F4FF),
-                          fontWeight: FontWeight.w600,
-                          fontSize: 16,
-                        ),
-                      ),
-                      const SizedBox(height: 4),
-                      Wrap(
-                        spacing: 4,
-                        runSpacing: 4,
-                        children: [
-                          _chip(
-                            role.toUpperCase(),
-                            role == 'journeyman'
-                                ? const Color(0xFF1E3A5F)
-                                : const Color(0xFFFF6B35).withOpacity(0.2),
-                            role == 'journeyman'
-                                ? const Color(0xFF7eb3ff)
-                                : const Color(0xFFFF6B35),
+                return GestureDetector(
+                  onTap: () => _openChat(matchId, name, role),
+                  child: Container(
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF111827),
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: const Color(0xFF1e2d45)),
+                    ),
+                    padding: const EdgeInsets.all(16),
+                    child: Row(
+                      children: [
+                        Container(
+                          width: 52,
+                          height: 52,
+                          decoration: BoxDecoration(
+                            color: const Color(0xFF1E3A5F),
+                            shape: BoxShape.circle,
+                            border: Border.all(color: const Color(0xFFFF6B35), width: 2),
                           ),
-                          if (expLabel.isNotEmpty)
-                            _chip(expLabel, const Color(0xFF1a2235), const Color(0xFF8896b0)),
-                        ],
-                      ),
-                      if (location.isNotEmpty) ...[
-                        const SizedBox(height: 4),
-                        Row(
-                          children: [
-                            const Icon(Icons.location_on, color: Color(0xFF8896b0), size: 12),
-                            const SizedBox(width: 2),
-                            Flexible(
-                              child: Text(
-                                location,
-                                style: const TextStyle(color: Color(0xFF8896b0), fontSize: 12),
-                                overflow: TextOverflow.ellipsis,
-                              ),
-                            ),
-                          ],
+                          child: const Icon(Icons.person, color: Color(0xFFFF6B35), size: 28),
                         ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                name,
+                                style: const TextStyle(
+                                  color: Color(0xFFF0F4FF),
+                                  fontWeight: FontWeight.w600,
+                                  fontSize: 16,
+                                ),
+                              ),
+                              const SizedBox(height: 4),
+                              Wrap(
+                                spacing: 4,
+                                runSpacing: 4,
+                                children: [
+                                  _chip(
+                                    role.toUpperCase(),
+                                    role == 'journeyman'
+                                        ? const Color(0xFF1E3A5F)
+                                        : const Color(0xFFFF6B35).withOpacity(0.2),
+                                    role == 'journeyman'
+                                        ? const Color(0xFF7eb3ff)
+                                        : const Color(0xFFFF6B35),
+                                  ),
+                                  if (expLabel.isNotEmpty)
+                                    _chip(expLabel, const Color(0xFF1a2235), const Color(0xFF8896b0)),
+                                  if (availShort.isNotEmpty)
+                                    _chip(
+                                      availShort,
+                                      CrewConstants.availabilityColor(availability)
+                                          .withOpacity(0.15),
+                                      CrewConstants.availabilityColor(availability),
+                                    ),
+                                ],
+                              ),
+                              if (location.isNotEmpty) ...[
+                                const SizedBox(height: 4),
+                                Row(
+                                  children: [
+                                    const Icon(Icons.location_on, color: Color(0xFF8896b0), size: 12),
+                                    const SizedBox(width: 2),
+                                    Flexible(
+                                      child: Text(
+                                        location,
+                                        style: const TextStyle(color: Color(0xFF8896b0), fontSize: 12),
+                                        overflow: TextOverflow.ellipsis,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ],
+                              const SizedBox(height: 4),
+                              const Text(
+                                'Tap to chat →',
+                                style: TextStyle(color: Color(0xFFFF6B35), fontSize: 12, fontWeight: FontWeight.w600),
+                              ),
+                            ],
+                          ),
+                        ),
+                        const Icon(Icons.chevron_right, color: Color(0xFF8896b0), size: 20),
                       ],
-                      const SizedBox(height: 4),
-                      const Text(
-                        'Tap to chat →',
-                        style: TextStyle(color: Color(0xFFFF6B35), fontSize: 12, fontWeight: FontWeight.w600),
-                      ),
-                    ],
+                    ),
                   ),
-                ),
-                const Icon(Icons.chevron_right, color: Color(0xFF8896b0), size: 20),
-              ],
+                );
+              },
             ),
-          ),
-        );
-      },
     );
   }
 
   Widget _buildJobsTab() {
-    if (_jobMatches.isEmpty) {
-      return _buildEmpty('📋', 'No saved jobs yet', 'Swipe right on jobs you like');
-    }
+    return RefreshIndicator(
+      onRefresh: _loadAll,
+      color: CrewConstants.primary,
+      child: _jobMatches.isEmpty
+          ? _buildEmptyScrollable('📋', 'No saved jobs yet', 'Swipe right on jobs you like')
+          : ListView.separated(
+              physics: const AlwaysScrollableScrollPhysics(),
+              padding: const EdgeInsets.all(16),
+              itemCount: _jobMatches.length,
+              separatorBuilder: (_, __) => const SizedBox(height: 8),
+              itemBuilder: (context, index) {
+                final job = _jobMatches[index];
+                final title = job['title'] ?? 'Untitled Job';
+                final location = job['location_text'] ?? '';
+                final rate = job['hourly_rate'];
+                final duration = job['duration_days'];
+                final experience = job['experience_required'] ?? 'any';
+                final expLabel = CrewConstants.expToLabel(experience);
 
-    return ListView.separated(
-      padding: const EdgeInsets.all(16),
-      itemCount: _jobMatches.length,
-      separatorBuilder: (_, __) => const SizedBox(height: 8),
-      itemBuilder: (context, index) {
-        final job = _jobMatches[index];
-        final title = job['title'] ?? 'Untitled Job';
-        final location = job['location_text'] ?? '';
-        final rate = job['hourly_rate'];
-        final duration = job['duration_days'];
-        final experience = job['experience_required'] ?? 'any';
-
-        String expLabel = experience;
-        switch (experience) {
-          case 'any': expLabel = 'Any Level'; break;
-          case 'apprentice': expLabel = 'Apprentice'; break;
-          case 'journeyman': expLabel = 'Journeyman'; break;
-          case 'master': expLabel = 'Journeyman'; break;
-        }
-
-        return Container(
-          decoration: BoxDecoration(
-            color: const Color(0xFF111827),
-            borderRadius: BorderRadius.circular(12),
-            border: Border.all(color: const Color(0xFF1e2d45)),
-          ),
-          child: Padding(
-            padding: const EdgeInsets.all(16),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  children: [
-                    Container(
-                      width: 44,
-                      height: 44,
-                      decoration: BoxDecoration(
-                        color: const Color(0xFF1E3A5F),
-                        borderRadius: BorderRadius.circular(10),
-                        border: Border.all(color: const Color(0xFFFF6B35), width: 1.5),
-                      ),
-                      child: const Icon(Icons.work, color: Color(0xFFFF6B35), size: 22),
+                return GestureDetector(
+                  onTap: () => _openJob(job),
+                  child: Container(
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF111827),
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: const Color(0xFF1e2d45)),
                     ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: Text(
-                        title,
-                        style: const TextStyle(color: Color(0xFFF0F4FF), fontSize: 15, fontWeight: FontWeight.w700),
+                    child: Padding(
+                      padding: const EdgeInsets.all(16),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            children: [
+                              Container(
+                                width: 44,
+                                height: 44,
+                                decoration: BoxDecoration(
+                                  color: const Color(0xFF1E3A5F),
+                                  borderRadius: BorderRadius.circular(10),
+                                  border: Border.all(color: const Color(0xFFFF6B35), width: 1.5),
+                                ),
+                                child: const Icon(Icons.work, color: Color(0xFFFF6B35), size: 22),
+                              ),
+                              const SizedBox(width: 12),
+                              Expanded(
+                                child: Text(
+                                  title,
+                                  style: const TextStyle(color: Color(0xFFF0F4FF), fontSize: 15, fontWeight: FontWeight.w700),
+                                ),
+                              ),
+                              const Icon(Icons.chevron_right, color: Color(0xFF8896b0), size: 20),
+                            ],
+                          ),
+                          const SizedBox(height: 10),
+                          Wrap(
+                            spacing: 6,
+                            runSpacing: 6,
+                            children: [
+                              if (location.isNotEmpty) _chip('📍 $location', const Color(0xFF1a2235), const Color(0xFF8896b0)),
+                              if (rate != null) _chip('\$$rate/hr', const Color(0xFF22c55e).withOpacity(0.15), const Color(0xFF22c55e)),
+                              if (duration != null) _chip('$duration days', const Color(0xFF1a2235), const Color(0xFF8896b0)),
+                              _chip(expLabel, const Color(0xFF1E3A5F), const Color(0xFF7eb3ff)),
+                            ],
+                          ),
+                          const SizedBox(height: 10),
+                          Text(
+                            job['description'] ?? '',
+                            style: const TextStyle(color: Color(0xFF8896b0), fontSize: 13),
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ],
                       ),
                     ),
-                  ],
-                ),
-                const SizedBox(height: 10),
-                Wrap(
-                  spacing: 6,
-                  runSpacing: 6,
-                  children: [
-                    if (location.isNotEmpty) _chip('📍 $location', const Color(0xFF1a2235), const Color(0xFF8896b0)),
-                    if (rate != null) _chip('\$$rate/hr', const Color(0xFF22c55e).withOpacity(0.15), const Color(0xFF22c55e)),
-                    if (duration != null) _chip('$duration days', const Color(0xFF1a2235), const Color(0xFF8896b0)),
-                    _chip(expLabel, const Color(0xFF1E3A5F), const Color(0xFF7eb3ff)),
-                  ],
-                ),
-                const SizedBox(height: 10),
-                Text(
-                  job['description'] ?? '',
-                  style: const TextStyle(color: Color(0xFF8896b0), fontSize: 13),
-                  maxLines: 2,
-                  overflow: TextOverflow.ellipsis,
-                ),
-              ],
+                  ),
+                );
+              },
             ),
-          ),
-        );
-      },
+    );
+  }
+
+  Widget _buildEmptyScrollable(String emoji, String title, String subtitle) {
+    return ListView(
+      physics: const AlwaysScrollableScrollPhysics(),
+      children: [
+        SizedBox(
+          height: MediaQuery.of(context).size.height * 0.7,
+          child: _buildEmpty(emoji, title, subtitle),
+        ),
+      ],
     );
   }
 

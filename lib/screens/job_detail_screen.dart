@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+import '../crew_constants.dart';
+import '../error_helper.dart';
 import 'chat_screen.dart';
 
 class JobDetailScreen extends StatefulWidget {
@@ -12,8 +14,9 @@ class JobDetailScreen extends StatefulWidget {
 class _JobDetailScreenState extends State<JobDetailScreen> {
   String? _matchId;
   String _posterName = 'Unknown';
-  String _posterRole = 'journeyman';
+  final String _posterRole = 'journeyman';
   bool _loading = true;
+  bool _connecting = false;
 
   @override
   void initState() { super.initState(); _loadMatchAndPoster(); }
@@ -21,13 +24,17 @@ class _JobDetailScreenState extends State<JobDetailScreen> {
   Future<void> _loadMatchAndPoster() async {
     final userId = Supabase.instance.client.auth.currentUser?.id;
     final journeymanId = widget.job['journeyman_id'];
-    if (userId == null || journeymanId == null) { setState(() => _loading = false); return; }
+    if (userId == null || journeymanId == null) { if (mounted) setState(() => _loading = false); return; }
     try {
       final posterRes = await Supabase.instance.client.from('profiles').select('full_name').eq('user_id', journeymanId).maybeSingle();
       _posterName = posterRes?['full_name'] ?? 'Unknown';
       final matchRes = await Supabase.instance.client.from('matches').select('id').eq('journeyman_id', journeymanId).eq('helper_id', userId).maybeSingle();
       if (matchRes != null) { _matchId = matchRes['id'].toString(); }
-    } catch (e) { debugPrint('Error: $e'); }
+    } catch (e) {
+      if (!mounted) return;
+      AppFeedback.showError(context, e);
+    }
+    if (!mounted) return;
     setState(() => _loading = false);
   }
 
@@ -35,14 +42,29 @@ class _JobDetailScreenState extends State<JobDetailScreen> {
     final userId = Supabase.instance.client.auth.currentUser?.id;
     final journeymanId = widget.job['journeyman_id'];
     if (userId == null || journeymanId == null) return;
+    setState(() => _connecting = true);
     try {
       final res = await Supabase.instance.client.from('matches').insert({'journeyman_id': journeymanId, 'helper_id': userId, 'job_id': widget.job['id']}).select('id').single();
       _matchId = res['id'].toString();
-      if (mounted) _openChat();
+      if (!mounted) return;
+      setState(() => _connecting = false);
+      _openChat();
     } catch (e) {
-      final existing = await Supabase.instance.client.from('matches').select('id').eq('journeyman_id', journeymanId).eq('helper_id', userId).maybeSingle();
-      if (existing != null) { _matchId = existing['id'].toString(); if (mounted) _openChat(); }
-      else { if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error: $e'), backgroundColor: const Color(0xFFef4444))); }
+      try {
+        final existing = await Supabase.instance.client.from('matches').select('id').eq('journeyman_id', journeymanId).eq('helper_id', userId).maybeSingle();
+        if (!mounted) return;
+        setState(() => _connecting = false);
+        if (existing != null) {
+          _matchId = existing['id'].toString();
+          _openChat();
+        } else {
+          AppFeedback.showError(context, e);
+        }
+      } catch (e2) {
+        if (!mounted) return;
+        setState(() => _connecting = false);
+        AppFeedback.showError(context, e2);
+      }
     }
   }
 
@@ -55,12 +77,11 @@ class _JobDetailScreenState extends State<JobDetailScreen> {
   Widget build(BuildContext context) {
     final title = widget.job['title'] ?? 'Untitled Job';
     final description = widget.job['description'] ?? 'No description.';
-    final location = widget.job['location_text'] ?? 'Alberta';
+    final location = widget.job['location_text'] ?? 'Location not specified';
     final rate = widget.job['hourly_rate'];
     final duration = widget.job['duration_days'];
     final experience = widget.job['experience_required'] ?? 'any';
-    String expLabel = experience;
-    switch (experience) { case 'any': expLabel = 'Any Level'; break; case 'apprentice': expLabel = 'Apprentice'; break; case 'journeyman': expLabel = 'Journeyman'; break; case 'master': expLabel = 'Journeyman'; break; }
+    final expLabel = CrewConstants.expToLabel(experience);
 
     return Scaffold(
       appBar: AppBar(title: const Text('JOB DETAILS'), leading: IconButton(icon: const Icon(Icons.arrow_back), onPressed: () => Navigator.pop(context))),
@@ -90,7 +111,7 @@ class _JobDetailScreenState extends State<JobDetailScreen> {
                 _ei('📍', 'Work location: $location'),
                 if (rate != null) _ei('💰', 'Pay: \$$rate/hr ${rate >= 45 ? "(above average)" : ""}'),
                 if (duration != null) _ei('📅', 'Duration: $duration days'),
-                _ei('🔧', 'Trade: Welding / Fabrication / Pipeline'),
+                _ei('🔧', 'Trade: ${widget.job['trade_type'] ?? 'Not specified'}'),
                 _ei('👷', 'Experience: $expLabel'),
                 _ei('🏕️', 'Camp/LOA details available in chat'),
               ]),
@@ -134,7 +155,13 @@ class _JobDetailScreenState extends State<JobDetailScreen> {
         decoration: const BoxDecoration(color: Color(0xFF111827), border: Border(top: BorderSide(color: Color(0xFF1e2d45)))),
         child: _matchId != null
             ? ElevatedButton.icon(onPressed: _openChat, icon: const Icon(Icons.chat, size: 18), label: Text('MESSAGE ${_posterName.toUpperCase()}'))
-            : ElevatedButton.icon(onPressed: _createMatchAndChat, icon: const Icon(Icons.handshake, size: 18), label: Text('CONNECT WITH ${_posterName.toUpperCase()}')),
+            : ElevatedButton.icon(
+                onPressed: _connecting ? null : _createMatchAndChat,
+                icon: _connecting
+                    ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2, color: CrewConstants.textPrimary))
+                    : const Icon(Icons.handshake, size: 18),
+                label: Text(_connecting ? 'CONNECTING...' : 'CONNECT WITH ${_posterName.toUpperCase()}'),
+              ),
       ),
     );
   }

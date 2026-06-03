@@ -1,6 +1,27 @@
-import 'dart:math';
+// Chat screen — real-time 1:1 messaging backed by Supabase Realtime.
+//
+// Messages live in the "chat_messages" table (already added to the
+// "supabase_realtime" publication). We subscribe to a filtered stream so new
+// rows inserted by EITHER user appear instantly. Outgoing messages use an
+// optimistic-UI pattern: they show immediately as "sending", are awaited into
+// the database, then confirmed via the realtime stream (or marked failed/red).
+//
+// SQL MIGRATION (see supabase_migrations.sql):
+//   create table public.chat_messages (
+//     id uuid primary key default gen_random_uuid(),
+//     match_id uuid references public.matches(id),
+//     sender_id uuid references auth.users(id),
+//     content text not null,
+//     sent_at timestamptz not null default now(),
+//     read_at timestamptz
+//   );
+
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+
+import '../crew_constants.dart';
+import '../error_helper.dart';
 
 class ChatScreen extends StatefulWidget {
   final String matchId;
@@ -19,98 +40,57 @@ class ChatScreen extends StatefulWidget {
 }
 
 class _ChatScreenState extends State<ChatScreen> {
+  static const String _table = 'chat_messages';
+
   final _messageController = TextEditingController();
   final _scrollController = ScrollController();
+
+  /// Server truth, delivered by the realtime stream (sorted by sent_at asc).
   List<Map<String, dynamic>> _messages = [];
+
+  /// Optimistic messages I've sent that aren't confirmed yet. Each is:
+  /// {tempId, content, sent_at, status: 'sending'|'failed'}.
+  final List<Map<String, dynamic>> _pending = [];
+
+  StreamSubscription<List<Map<String, dynamic>>>? _sub;
   bool _loading = true;
-  bool _otherTyping = false;
   String? _userId;
-  final _random = Random();
-
-  final List<String> _journeymanResponses = [
-    "Yeah bud, we got a big job coming up on the pipeline near Rocky. You available next week?",
-    "How many years you got under your belt? We need someone who can run a bead clean first try.",
-    "Pay's good eh, 45 an hour plus LOA. Camp's not bad either, got wifi and decent grub.",
-    "Can you run 7018? That's mostly what we're burning out here on structural.",
-    "Last helper I had was greener than grass. You got your CSTS and H2S?",
-    "We're doing a turnaround up at Suncor next month. 14 and 7 rotation. You interested?",
-    "Bring your own bucket and lid. We supply the rod and wire though.",
-    "You comfortable working at heights? We got some pipe rack work coming up.",
-    "If you can stick it out for the whole shutdown we'll get you on the rehire list no problem.",
-    "I'll send you the safety paperwork tonight. Fill it out and we can get you mobilized by Monday.",
-    "Had a guy quit on me yesterday so I need someone ASAP. You good to fly up to Fort Mac?",
-    "We're union job so you'll need your UA card. You got that sorted?",
-    "The super's pretty chill as long as you show up on time and don't burn holes in everything eh.",
-    "What kinda rig you running? MIG or stick? We got both going on this project.",
-    "Tell you what, do a good job on this one and I'll keep you busy all winter.",
-  ];
-
-  final List<String> _helperResponses = [
-    "For sure bud, I'm available right now actually. Just finished up a job in Edson.",
-    "Yeah I got my CSTS, H2S, confined space, and fall pro all current. Can send you copies tonight.",
-    "I've been welding about 3 years now. Second year apprentice, mostly pipeline and structural.",
-    "That sounds awesome man. What's the camp situation like? And is it drive in drive out or fly?",
-    "I can run 7018, 6010, and flux core no problem. Still working on my TIG but getting there.",
-    "45 an hour? Yeah I'm definitely interested. When do you need me to start?",
-    "I got my own tools and PPE. Just need to know what boots you want, steel toe or composite?",
-    "I'm a hard worker eh. Last journeyman I worked for said I was the best helper he's had in years.",
-    "Can you send me the job scope? I wanna make sure I'm prepped and ready to go day one.",
-    "I'm in Red Deer right now but I can be up there in a few hours no problem.",
-    "Do I need to bring my own stinger and leads or is that supplied on site?",
-    "Sounds like a wicked opportunity. I'm trying to get my hours for my journeyman ticket.",
-    "I don't mind working OT either. More hours the better as far as I'm concerned.",
-    "My last job was doing B-pressure pipe at the Pembina gas plant. Good reference if you need one.",
-    "Just let me know what paperwork you need and I'll get it sorted ASAP.",
-  ];
-
-  final List<String> _journeymanGreetings = [
-    "Hey there! Saw your profile, looks like you got some decent experience. We're looking for a helper on a job up near Drayton Valley. Interested?",
-    "What's going on bud. You looking for work right now? Got a spot that needs filling pretty quick.",
-    "Hey! Good to connect. I got a pipeline tie-in job starting next week, could use an extra set of hands.",
-  ];
-
-  final List<String> _helperGreetings = [
-    "Hey! Thanks for matching. I saw you got some jobs posted, I'm definitely interested in hearing more about them.",
-    "What's up man! I'm looking for steady work right now. What kinda projects you got going on?",
-    "Hey there! Really looking to get on with a good crew. What's the work situation looking like?",
-  ];
-
-  int _responseIndex = 0;
-  int _myMessageCount = 0;
 
   @override
   void initState() {
     super.initState();
     _userId = Supabase.instance.client.auth.currentUser?.id;
-    _responseIndex = _random.nextInt(5);
-    _loadMessages();
+    _subscribe();
   }
 
-  Future<void> _loadMessages() async {
-    setState(() => _loading = true);
-
-    try {
-      final res = await Supabase.instance.client
-          .from('messages')
-          .select()
-          .eq('match_id', widget.matchId)
-          .order('sent_at', ascending: true);
-
-      setState(() {
-        _messages = (res as List).cast<Map<String, dynamic>>();
-        _myMessageCount = _messages.where((m) => m['sender_id'] == _userId).length;
-        _loading = false;
-      });
-
-      _scrollToBottom();
-    } catch (e) {
-      debugPrint('Error loading messages: $e');
-      setState(() => _loading = false);
-    }
+  void _subscribe() {
+    _sub = Supabase.instance.client
+        .from(_table)
+        .stream(primaryKey: ['id'])
+        .eq('match_id', widget.matchId)
+        .listen(
+      (rows) {
+        if (!mounted) return;
+        final sorted = [...rows]..sort((a, b) => (a['sent_at'] ?? '')
+            .toString()
+            .compareTo((b['sent_at'] ?? '').toString()));
+        setState(() {
+          _messages = sorted;
+          _loading = false;
+        });
+        _scrollToBottom();
+      },
+      onError: (Object e) {
+        if (!mounted) return;
+        setState(() => _loading = false);
+        AppFeedback.showError(context, e, fallback: 'Could not load messages');
+      },
+    );
   }
 
   void _scrollToBottom() {
     Future.delayed(const Duration(milliseconds: 100), () {
+      if (!mounted) return;
       if (_scrollController.hasClients) {
         _scrollController.animateTo(
           _scrollController.position.maxScrollExtent,
@@ -121,87 +101,51 @@ class _ChatScreenState extends State<ChatScreen> {
     });
   }
 
-  String _getAutoResponse() {
-    if (widget.otherUserRole == 'journeyman') {
-      if (_myMessageCount <= 1) {
-        return _journeymanGreetings[_random.nextInt(_journeymanGreetings.length)];
-      }
-      final response = _journeymanResponses[_responseIndex % _journeymanResponses.length];
-      _responseIndex++;
-      return response;
-    } else {
-      if (_myMessageCount <= 1) {
-        return _helperGreetings[_random.nextInt(_helperGreetings.length)];
-      }
-      final response = _helperResponses[_responseIndex % _helperResponses.length];
-      _responseIndex++;
-      return response;
-    }
-  }
-
-  void _doAutoResponse() {
-    // Step 1: Show typing indicator immediately
-    if (!mounted) return;
-    setState(() => _otherTyping = true);
-    _scrollToBottom();
-
-    // Step 2: After 800ms, show the response
-    Future.delayed(const Duration(milliseconds: 800), () {
-      if (!mounted) return;
-
-      final responseText = _getAutoResponse();
-      final fakeSenderId = 'auto_${widget.matchId.substring(0, 8)}';
-
-      setState(() {
-        _otherTyping = false;
-        _messages.add({
-          'id': 'auto_${DateTime.now().millisecondsSinceEpoch}',
-          'match_id': widget.matchId,
-          'sender_id': fakeSenderId,
-          'content': responseText,
-          'sent_at': DateTime.now().toUtc().toIso8601String(),
-          'read_at': null,
-        });
-      });
-      _scrollToBottom();
-    });
-  }
-
   Future<void> _sendMessage() async {
     final text = _messageController.text.trim();
     if (text.isEmpty || _userId == null) return;
 
     _messageController.clear();
-    _myMessageCount++;
-
-    // Add my message to UI immediately
-    setState(() {
-      _messages.add({
-        'id': 'temp_${DateTime.now().millisecondsSinceEpoch}',
-        'match_id': widget.matchId,
-        'sender_id': _userId,
-        'content': text,
-        'sent_at': DateTime.now().toUtc().toIso8601String(),
-        'read_at': null,
-      });
-    });
+    final tempId = 'temp_${DateTime.now().microsecondsSinceEpoch}';
+    final pending = <String, dynamic>{
+      'tempId': tempId,
+      'content': text,
+      'sent_at': DateTime.now().toUtc().toIso8601String(),
+      'status': 'sending',
+    };
+    setState(() => _pending.add(pending));
     _scrollToBottom();
 
-    // Save to database (fire and forget)
-    Supabase.instance.client.from('messages').insert({
-      'match_id': widget.matchId,
-      'sender_id': _userId,
-      'content': text,
-    }).then((_) {}).catchError((e) {
-      debugPrint('Error saving message: $e');
-    });
+    await _insert(pending);
+  }
 
-    // Trigger auto response
-    _doAutoResponse();
+  Future<void> _insert(Map<String, dynamic> pending) async {
+    try {
+      await Supabase.instance.client.from(_table).insert({
+        'match_id': widget.matchId,
+        'sender_id': _userId,
+        'content': pending['content'],
+      });
+      if (!mounted) return;
+      // Confirmed: the realtime stream now (or imminently) carries the real
+      // row, so drop the optimistic placeholder.
+      setState(() => _pending.removeWhere((p) => p['tempId'] == pending['tempId']));
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => pending['status'] = 'failed');
+      AppFeedback.showError(context, e, fallback: 'Message failed to send');
+    }
+  }
+
+  Future<void> _retry(Map<String, dynamic> pending) async {
+    if (!mounted) return;
+    setState(() => pending['status'] = 'sending');
+    await _insert(pending);
   }
 
   @override
   void dispose() {
+    _sub?.cancel();
     _messageController.dispose();
     _scrollController.dispose();
     super.dispose();
@@ -209,60 +153,67 @@ class _ChatScreenState extends State<ChatScreen> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: Row(
-          children: [
-            Container(
-              width: 32,
-              height: 32,
-              decoration: BoxDecoration(
-                color: const Color(0xFF1E3A5F),
-                shape: BoxShape.circle,
-                border: Border.all(color: const Color(0xFFFF6B35), width: 1.5),
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: () => FocusScope.of(context).unfocus(),
+      child: Scaffold(
+        appBar: AppBar(
+          title: Row(
+            children: [
+              Container(
+                width: 32,
+                height: 32,
+                decoration: BoxDecoration(
+                  color: CrewConstants.secondary,
+                  shape: BoxShape.circle,
+                  border: Border.all(color: CrewConstants.primary, width: 1.5),
+                ),
+                child: const Icon(Icons.person,
+                    color: CrewConstants.primary, size: 16),
               ),
-              child: const Icon(Icons.person, color: Color(0xFFFF6B35), size: 16),
-            ),
-            const SizedBox(width: 10),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    widget.otherUserName,
-                    style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
-                  ),
-                  Text(
-                    _otherTyping ? 'typing...' : widget.otherUserRole.toUpperCase(),
-                    style: TextStyle(
-                      fontSize: 11,
-                      color: _otherTyping ? const Color(0xFF22c55e) : const Color(0xFF8896b0),
-                      letterSpacing: 1,
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      widget.otherUserName,
+                      style: const TextStyle(
+                          fontSize: 16, fontWeight: FontWeight.w600),
                     ),
-                  ),
-                ],
+                    Text(
+                      widget.otherUserRole.toUpperCase(),
+                      style: const TextStyle(
+                        fontSize: 11,
+                        color: CrewConstants.textSecondary,
+                        letterSpacing: 1,
+                      ),
+                    ),
+                  ],
+                ),
               ),
+            ],
+          ),
+          leading: IconButton(
+            icon: const Icon(Icons.arrow_back),
+            onPressed: () => Navigator.pop(context),
+          ),
+        ),
+        body: Column(
+          children: [
+            Expanded(
+              child: _loading
+                  ? const Center(
+                      child:
+                          CircularProgressIndicator(color: CrewConstants.primary),
+                    )
+                  : (_messages.isEmpty && _pending.isEmpty)
+                      ? _buildEmptyChat()
+                      : _buildMessageList(),
             ),
+            _buildInputBar(),
           ],
         ),
-        leading: IconButton(
-          icon: const Icon(Icons.arrow_back),
-          onPressed: () => Navigator.pop(context),
-        ),
-      ),
-      body: Column(
-        children: [
-          Expanded(
-            child: _loading
-                ? const Center(
-                    child: CircularProgressIndicator(color: Color(0xFFFF6B35)),
-                  )
-                : _messages.isEmpty
-                    ? _buildEmptyChat()
-                    : _buildMessageList(),
-          ),
-          _buildInputBar(),
-        ],
       ),
     );
   }
@@ -277,7 +228,7 @@ class _ChatScreenState extends State<ChatScreen> {
           const Text(
             'No messages yet',
             style: TextStyle(
-              color: Color(0xFFF0F4FF),
+              color: CrewConstants.textPrimary,
               fontSize: 20,
               fontWeight: FontWeight.w700,
             ),
@@ -285,7 +236,7 @@ class _ChatScreenState extends State<ChatScreen> {
           const SizedBox(height: 8),
           Text(
             'Say hello to ${widget.otherUserName}!',
-            style: const TextStyle(color: Color(0xFF8896b0)),
+            style: const TextStyle(color: CrewConstants.textSecondary),
           ),
         ],
       ),
@@ -293,132 +244,156 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Widget _buildMessageList() {
+    final total = _messages.length + _pending.length;
     return ListView.builder(
       controller: _scrollController,
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-      itemCount: _messages.length + (_otherTyping ? 1 : 0),
+      itemCount: total,
       itemBuilder: (context, index) {
-        if (_otherTyping && index == _messages.length) {
-          return Padding(
-            padding: const EdgeInsets.only(bottom: 8),
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.start,
+        if (index < _messages.length) {
+          final message = _messages[index];
+          final isMe = message['sender_id'] == _userId;
+          return _bubble(
+            content: (message['content'] ?? '').toString(),
+            isMe: isMe,
+            timeLabel: _timeLabel(message['sent_at']),
+            status: null,
+          );
+        }
+        // Optimistic (pending) message — always mine.
+        final pending = _pending[index - _messages.length];
+        return _bubble(
+          content: (pending['content'] ?? '').toString(),
+          isMe: true,
+          timeLabel: _timeLabel(pending['sent_at']),
+          status: pending['status'] as String?,
+          onRetry: pending['status'] == 'failed' ? () => _retry(pending) : null,
+        );
+      },
+    );
+  }
+
+  String _timeLabel(dynamic sentAt) {
+    try {
+      final dt = DateTime.parse(sentAt.toString()).toLocal();
+      final hour = dt.hour > 12 ? dt.hour - 12 : (dt.hour == 0 ? 12 : dt.hour);
+      final amPm = dt.hour >= 12 ? 'PM' : 'AM';
+      final minute = dt.minute.toString().padLeft(2, '0');
+      return '$hour:$minute $amPm';
+    } catch (_) {
+      return '';
+    }
+  }
+
+  Widget _bubble({
+    required String content,
+    required bool isMe,
+    required String timeLabel,
+    String? status,
+    VoidCallback? onRetry,
+  }) {
+    final failed = status == 'failed';
+    final sending = status == 'sending';
+
+    final bubble = Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+      decoration: BoxDecoration(
+        color: isMe
+            ? (failed ? CrewConstants.danger : CrewConstants.primary)
+            : CrewConstants.surface,
+        borderRadius: BorderRadius.only(
+          topLeft: const Radius.circular(16),
+          topRight: const Radius.circular(16),
+          bottomLeft:
+              isMe ? const Radius.circular(16) : const Radius.circular(4),
+          bottomRight:
+              isMe ? const Radius.circular(4) : const Radius.circular(16),
+        ),
+        border: isMe ? null : Border.all(color: CrewConstants.border),
+      ),
+      child: Text(
+        content,
+        style: TextStyle(
+          color: isMe ? Colors.white : CrewConstants.textPrimary,
+          fontSize: 15,
+          height: 1.4,
+        ),
+      ),
+    );
+
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: Row(
+        mainAxisAlignment:
+            isMe ? MainAxisAlignment.end : MainAxisAlignment.start,
+        children: [
+          if (!isMe)
+            Container(
+              width: 32,
+              height: 32,
+              decoration: BoxDecoration(
+                color: CrewConstants.secondary,
+                shape: BoxShape.circle,
+                border: Border.all(color: CrewConstants.primary, width: 1.5),
+              ),
+              child: const Icon(Icons.person,
+                  color: CrewConstants.primary, size: 16),
+            ),
+          if (!isMe) const SizedBox(width: 8),
+          Flexible(
+            child: Column(
+              crossAxisAlignment:
+                  isMe ? CrossAxisAlignment.end : CrossAxisAlignment.start,
               children: [
-                Container(
-                  width: 32,
-                  height: 32,
-                  decoration: BoxDecoration(
-                    color: const Color(0xFF1E3A5F),
-                    shape: BoxShape.circle,
-                    border: Border.all(color: const Color(0xFFFF6B35), width: 1.5),
-                  ),
-                  child: const Icon(Icons.person, color: Color(0xFFFF6B35), size: 16),
-                ),
-                const SizedBox(width: 8),
-                Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-                  decoration: BoxDecoration(
-                    color: const Color(0xFF111827),
-                    borderRadius: BorderRadius.circular(16),
-                    border: Border.all(color: const Color(0xFF1e2d45)),
-                  ),
-                  child: const Text(
-                    '• • •',
-                    style: TextStyle(color: Color(0xFF8896b0), fontSize: 16, letterSpacing: 2),
+                bubble,
+                Padding(
+                  padding: const EdgeInsets.only(top: 4),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      if (sending) ...[
+                        const SizedBox(
+                          width: 10,
+                          height: 10,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 1.5,
+                            color: CrewConstants.textSecondary,
+                          ),
+                        ),
+                        const SizedBox(width: 4),
+                        const Text('Sending…',
+                            style: TextStyle(
+                                color: CrewConstants.textSecondary,
+                                fontSize: 10)),
+                      ] else if (failed) ...[
+                        const Icon(Icons.error_outline,
+                            color: CrewConstants.danger, size: 12),
+                        const SizedBox(width: 4),
+                        GestureDetector(
+                          onTap: onRetry,
+                          child: const Text('Failed — tap to retry',
+                              style: TextStyle(
+                                  color: CrewConstants.danger,
+                                  fontSize: 10,
+                                  fontWeight: FontWeight.w600)),
+                        ),
+                      ] else if (timeLabel.isNotEmpty)
+                        Text(
+                          timeLabel,
+                          style: const TextStyle(
+                            color: CrewConstants.textSecondary,
+                            fontSize: 10,
+                          ),
+                        ),
+                    ],
                   ),
                 ),
               ],
             ),
-          );
-        }
-
-        final message = _messages[index];
-        final isMe = message['sender_id'] == _userId;
-        final content = message['content'] ?? '';
-        final sentAt = message['sent_at'] ?? '';
-
-        String timeLabel = '';
-        try {
-          final dt = DateTime.parse(sentAt).toLocal();
-          final hour = dt.hour > 12 ? dt.hour - 12 : (dt.hour == 0 ? 12 : dt.hour);
-          final amPm = dt.hour >= 12 ? 'PM' : 'AM';
-          final minute = dt.minute.toString().padLeft(2, '0');
-          timeLabel = '$hour:$minute $amPm';
-        } catch (e) {
-          timeLabel = '';
-        }
-
-        return Padding(
-          padding: const EdgeInsets.only(bottom: 8),
-          child: Row(
-            mainAxisAlignment:
-                isMe ? MainAxisAlignment.end : MainAxisAlignment.start,
-            children: [
-              if (!isMe)
-                Container(
-                  width: 32,
-                  height: 32,
-                  decoration: BoxDecoration(
-                    color: const Color(0xFF1E3A5F),
-                    shape: BoxShape.circle,
-                    border: Border.all(color: const Color(0xFFFF6B35), width: 1.5),
-                  ),
-                  child: const Icon(Icons.person, color: Color(0xFFFF6B35), size: 16),
-                ),
-              if (!isMe) const SizedBox(width: 8),
-              Flexible(
-                child: Column(
-                  crossAxisAlignment:
-                      isMe ? CrossAxisAlignment.end : CrossAxisAlignment.start,
-                  children: [
-                    Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-                      decoration: BoxDecoration(
-                        color: isMe
-                            ? const Color(0xFFFF6B35)
-                            : const Color(0xFF111827),
-                        borderRadius: BorderRadius.only(
-                          topLeft: const Radius.circular(16),
-                          topRight: const Radius.circular(16),
-                          bottomLeft: isMe
-                              ? const Radius.circular(16)
-                              : const Radius.circular(4),
-                          bottomRight: isMe
-                              ? const Radius.circular(4)
-                              : const Radius.circular(16),
-                        ),
-                        border: isMe
-                            ? null
-                            : Border.all(color: const Color(0xFF1e2d45)),
-                      ),
-                      child: Text(
-                        content,
-                        style: TextStyle(
-                          color: isMe ? Colors.white : const Color(0xFFF0F4FF),
-                          fontSize: 15,
-                          height: 1.4,
-                        ),
-                      ),
-                    ),
-                    if (timeLabel.isNotEmpty)
-                      Padding(
-                        padding: const EdgeInsets.only(top: 4),
-                        child: Text(
-                          timeLabel,
-                          style: const TextStyle(
-                            color: Color(0xFF8896b0),
-                            fontSize: 10,
-                          ),
-                        ),
-                      ),
-                  ],
-                ),
-              ),
-              if (isMe) const SizedBox(width: 8),
-            ],
           ),
-        );
-      },
+          if (isMe) const SizedBox(width: 8),
+        ],
+      ),
     );
   }
 
@@ -426,9 +401,9 @@ class _ChatScreenState extends State<ChatScreen> {
     return Container(
       padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
       decoration: const BoxDecoration(
-        color: Color(0xFF111827),
+        color: CrewConstants.surface,
         border: Border(
-          top: BorderSide(color: Color(0xFF1e2d45), width: 1),
+          top: BorderSide(color: CrewConstants.border, width: 1),
         ),
       ),
       child: Row(
@@ -436,20 +411,26 @@ class _ChatScreenState extends State<ChatScreen> {
           Expanded(
             child: Container(
               decoration: BoxDecoration(
-                color: const Color(0xFF0A0E1A),
+                color: CrewConstants.background,
                 borderRadius: BorderRadius.circular(24),
-                border: Border.all(color: const Color(0xFF1e2d45)),
+                border: Border.all(color: CrewConstants.border),
               ),
               child: TextField(
                 controller: _messageController,
-                style: const TextStyle(color: Color(0xFFF0F4FF), fontSize: 15),
+                style: const TextStyle(
+                    color: CrewConstants.textPrimary, fontSize: 15),
+                maxLength: 2000,
+                minLines: 1,
+                maxLines: 5,
                 decoration: const InputDecoration(
                   hintText: 'Type a message...',
-                  hintStyle: TextStyle(color: Color(0xFF8896b0)),
+                  hintStyle: TextStyle(color: CrewConstants.textSecondary),
                   border: InputBorder.none,
                   enabledBorder: InputBorder.none,
                   focusedBorder: InputBorder.none,
-                  contentPadding: EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                  counterText: '',
+                  contentPadding:
+                      EdgeInsets.symmetric(horizontal: 16, vertical: 10),
                   filled: false,
                 ),
                 textInputAction: TextInputAction.send,
@@ -464,7 +445,7 @@ class _ChatScreenState extends State<ChatScreen> {
               width: 44,
               height: 44,
               decoration: const BoxDecoration(
-                color: Color(0xFFFF6B35),
+                color: CrewConstants.primary,
                 shape: BoxShape.circle,
               ),
               child: const Icon(Icons.send, color: Colors.white, size: 20),

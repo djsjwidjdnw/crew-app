@@ -1,9 +1,11 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'screens/splash_screen.dart';
 import 'screens/login_screen.dart';
 import 'screens/register_screen.dart';
 import 'screens/home_screen.dart';
+import 'notifications_service.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -13,19 +15,62 @@ Future<void> main() async {
     anonKey: 'sb_publishable_phblhYkdvoKyr2FG8R2fcA_A4j0G9Vp',
   );
 
+  // Best-effort: build the push-notification infrastructure. Safe on web
+  // (no-op) and before Firebase is configured (degrades quietly).
+  try {
+    await NotificationsService.initialize();
+  } catch (_) {
+    // Never block app startup on notifications setup.
+  }
+
   runApp(const CrewApp());
 }
 
 final supabase = Supabase.instance.client;
 
-class CrewApp extends StatelessWidget {
+class CrewApp extends StatefulWidget {
   const CrewApp({super.key});
+
+  @override
+  State<CrewApp> createState() => _CrewAppState();
+}
+
+class _CrewAppState extends State<CrewApp> {
+  /// Global navigator so the auth listener can redirect from anywhere.
+  static final GlobalKey<NavigatorState> navigatorKey =
+      GlobalKey<NavigatorState>();
+
+  StreamSubscription<AuthState>? _authSub;
+
+  @override
+  void initState() {
+    super.initState();
+    // Global session-expiry handling: when the user is signed out (including a
+    // failed token refresh / expired session), bounce to /login and clear the
+    // back stack so authed screens are never left visible.
+    _authSub = Supabase.instance.client.auth.onAuthStateChange.listen((data) {
+      final event = data.event;
+      if (event == AuthChangeEvent.signedOut) {
+        navigatorKey.currentState?.pushNamedAndRemoveUntil(
+          '/login',
+          (route) => false,
+        );
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _authSub?.cancel();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'Crew',
       debugShowCheckedModeBanner: false,
+      navigatorKey: navigatorKey,
       theme: ThemeData(
         useMaterial3: true,
         brightness: Brightness.dark,

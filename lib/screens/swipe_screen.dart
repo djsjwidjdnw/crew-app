@@ -3,6 +3,7 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:appinio_swiper/appinio_swiper.dart';
 import 'package:geolocator/geolocator.dart';
 import '../crew_constants.dart';
+import '../error_helper.dart';
 import 'view_profile_screen.dart';
 import 'job_detail_screen.dart';
 
@@ -24,7 +25,6 @@ class _SwipeScreenState extends State<SwipeScreen> {
   bool _gettingLocation = false;
   String? _userId;
   String? _userRole;
-  Position? _myPosition;
   double? _myLat;
   double? _myLng;
 
@@ -71,7 +71,7 @@ class _SwipeScreenState extends State<SwipeScreen> {
         _myLng = (profileRes['longitude'] as num?)?.toDouble();
       }
     } catch (e) {
-      debugPrint('Error loading current user: $e');
+      if (mounted) AppFeedback.showError(context, e);
     }
   }
 
@@ -80,26 +80,36 @@ class _SwipeScreenState extends State<SwipeScreen> {
     try {
       bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
       if (!serviceEnabled) {
-        _gettingLocation = false;
+        if (!mounted) return;
+        AppFeedback.showInfo(
+            context, 'Location off — distance filtering disabled');
+        setState(() => _gettingLocation = false);
         return;
       }
       LocationPermission permission = await Geolocator.checkPermission();
       if (permission == LocationPermission.denied) {
         permission = await Geolocator.requestPermission();
         if (permission == LocationPermission.denied) {
-          _gettingLocation = false;
+          if (!mounted) return;
+          AppFeedback.showInfo(
+              context, 'Location off — distance filtering disabled');
+          setState(() => _gettingLocation = false);
           return;
         }
       }
       if (permission == LocationPermission.deniedForever) {
-        _gettingLocation = false;
+        if (!mounted) return;
+        AppFeedback.showInfo(
+            context, 'Location off — distance filtering disabled');
+        setState(() => _gettingLocation = false);
         return;
       }
-      _myPosition = await Geolocator.getCurrentPosition(
+      final position = await Geolocator.getCurrentPosition(
           locationSettings:
               const LocationSettings(accuracy: LocationAccuracy.medium));
-      _myLat = _myPosition?.latitude ?? _myLat;
-      _myLng = _myPosition?.longitude ?? _myLng;
+      if (!mounted) return;
+      _myLat = position.latitude;
+      _myLng = position.longitude;
 
       // Optionally save back to profile
       if (_userId != null && _myLat != null && _myLng != null) {
@@ -108,16 +118,18 @@ class _SwipeScreenState extends State<SwipeScreen> {
               .from('profiles')
               .update({'latitude': _myLat, 'longitude': _myLng})
               .eq('user_id', _userId!);
-        } catch (_) {}
+        } catch (e) {
+          if (mounted) AppFeedback.showError(context, e);
+        }
       }
     } catch (e) {
-      debugPrint('Location error: $e');
+      if (mounted) AppFeedback.showError(context, e);
     }
     if (mounted) setState(() => _gettingLocation = false);
   }
 
   Future<void> _loadCards() async {
-    setState(() => _loading = true);
+    if (mounted) setState(() => _loading = true);
     if (widget.mode == 'people') {
       await _loadPeople();
     } else {
@@ -188,22 +200,63 @@ class _SwipeScreenState extends State<SwipeScreen> {
           .limit(100);
 
       final users = (usersRes as List).cast<Map<String, dynamic>>();
+
+      // Collect candidate ids (skip already-swiped) so we can batch-fetch
+      // profiles and ratings in single queries (avoids N+1).
+      final candidateIds = <String>[];
+      for (final user in users) {
+        final uid = user['id'] as String;
+        if (swipedIds.contains(uid)) continue;
+        candidateIds.add(uid);
+      }
+
+      // Fetch all profiles in ONE query.
+      final Map<String, Map<String, dynamic>> profilesById = {};
+      if (candidateIds.isNotEmpty) {
+        final profilesRes = await _supabase
+            .from('profiles')
+            .select(
+                'user_id, full_name, location_text, bio, experience_level, trade_type, years_in_field, phone, profile_photo_url, latitude, longitude, availability_status')
+            .inFilter('user_id', candidateIds);
+        for (final row in (profilesRes as List).cast<Map<String, dynamic>>()) {
+          final uid = row['user_id']?.toString();
+          if (uid != null) profilesById[uid] = row;
+        }
+      }
+
+      // Fetch all ratings in ONE query and aggregate average per user.
+      final Map<String, double> avgRatingById = {};
+      if (candidateIds.isNotEmpty) {
+        try {
+          final ratingsRes = await _supabase
+              .from('ratings')
+              .select('to_user_id, score')
+              .inFilter('to_user_id', candidateIds);
+          final sums = <String, int>{};
+          final counts = <String, int>{};
+          for (final row in (ratingsRes as List).cast<Map<String, dynamic>>()) {
+            final uid = row['to_user_id']?.toString();
+            final score = (row['score'] as num?)?.toInt();
+            if (uid == null || score == null) continue;
+            sums[uid] = (sums[uid] ?? 0) + score;
+            counts[uid] = (counts[uid] ?? 0) + 1;
+          }
+          sums.forEach((uid, total) {
+            final c = counts[uid] ?? 0;
+            if (c > 0) avgRatingById[uid] = total / c;
+          });
+        } catch (e) {
+          if (mounted) AppFeedback.showError(context, e);
+        }
+      }
+
       List<Map<String, dynamic>> filtered = [];
 
       for (final user in users) {
         final uid = user['id'] as String;
         if (swipedIds.contains(uid)) continue;
 
-        Map<String, dynamic>? profile;
-        try {
-          profile = await _supabase
-              .from('profiles')
-              .select(
-                  'full_name, location_text, bio, experience_level, trade_type, years_in_field, phone, profile_photo_url, latitude, longitude')
-              .eq('user_id', uid)
-              .maybeSingle();
-        } catch (_) {}
-
+        final profile = profilesById[uid];
         if (profile == null) continue;
 
         // Apply experience filter
@@ -234,6 +287,7 @@ class _SwipeScreenState extends State<SwipeScreen> {
           'user': user,
           'profile': profile,
           'distance_km': distanceKm,
+          'avg_rating': avgRatingById[uid],
         });
       }
 
@@ -254,7 +308,7 @@ class _SwipeScreenState extends State<SwipeScreen> {
 
       _cards = filtered;
     } catch (e) {
-      debugPrint('Error loading people: $e');
+      if (mounted) AppFeedback.showError(context, e);
       _cards = [];
     }
   }
@@ -306,7 +360,7 @@ class _SwipeScreenState extends State<SwipeScreen> {
 
       _cards = filtered;
     } catch (e) {
-      debugPrint('Error loading jobs: $e');
+      if (mounted) AppFeedback.showError(context, e);
       _cards = [];
     }
   }
@@ -322,38 +376,27 @@ class _SwipeScreenState extends State<SwipeScreen> {
 
       if (liked) {
         // Check for mutual like -> create match
-        try {
-          final mutual = await _supabase
-              .from('swipes')
-              .select('id')
-              .eq('swiper_id', otherUserId)
-              .eq('swiped_id', _userId!)
-              .eq('direction', 'like')
-              .maybeSingle();
-          if (mutual != null) {
-            final journeymanId =
-                _userRole == 'journeyman' ? _userId : otherUserId;
-            final helperId =
-                _userRole == 'journeyman' ? otherUserId : _userId;
-            try {
-              await _supabase.from('matches').insert({
-                'journeyman_id': journeymanId,
-                'helper_id': helperId,
-              });
-              if (mounted) {
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(
-                    content: Text('It\'s a match!'),
-                    backgroundColor: Color(0xFF22c55e),
-                  ),
-                );
-              }
-            } catch (_) {}
-          }
-        } catch (_) {}
+        final mutual = await _supabase
+            .from('swipes')
+            .select('id')
+            .eq('swiper_id', otherUserId)
+            .eq('swiped_id', _userId!)
+            .eq('direction', 'like')
+            .maybeSingle();
+        if (mutual != null) {
+          final journeymanId =
+              _userRole == 'journeyman' ? _userId : otherUserId;
+          final helperId = _userRole == 'journeyman' ? otherUserId : _userId;
+          await _supabase.from('matches').insert({
+            'journeyman_id': journeymanId,
+            'helper_id': helperId,
+          });
+          if (!mounted) return;
+          AppFeedback.showSuccess(context, "It's a match!");
+        }
       }
     } catch (e) {
-      debugPrint('Error recording swipe: $e');
+      if (mounted) AppFeedback.showError(context, e);
     }
   }
 
@@ -366,7 +409,7 @@ class _SwipeScreenState extends State<SwipeScreen> {
         'liked': liked,
       });
     } catch (e) {
-      debugPrint('Error recording job swipe: $e');
+      if (mounted) AppFeedback.showError(context, e);
     }
   }
 
@@ -562,30 +605,43 @@ class _SwipeScreenState extends State<SwipeScreen> {
   }
 
   Widget _buildEmpty() {
-    return Center(
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
+    return RefreshIndicator(
+      onRefresh: _loadCards,
+      color: const Color(0xFFFF6B35),
+      backgroundColor: const Color(0xFF111827),
+      child: ListView(
+        physics: const AlwaysScrollableScrollPhysics(),
         children: [
-          Text(widget.mode == 'people' ? '👥' : '🔨',
-              style: const TextStyle(fontSize: 48)),
-          const SizedBox(height: 16),
-          Text(
-              widget.mode == 'people'
-                  ? 'No one to swipe right now'
-                  : 'No jobs to swipe right now',
-              style: const TextStyle(
-                  color: Color(0xFFF0F4FF),
-                  fontSize: 20,
-                  fontWeight: FontWeight.w700)),
-          const SizedBox(height: 8),
-          const Text('Try widening your filters or check back later',
-              style: TextStyle(color: Color(0xFF8896b0)),
-              textAlign: TextAlign.center),
-          const SizedBox(height: 24),
-          ElevatedButton.icon(
-            onPressed: _showFilters,
-            icon: const Icon(Icons.tune, size: 18),
-            label: const Text('ADJUST FILTERS'),
+          SizedBox(
+            height: MediaQuery.of(context).size.height * 0.7,
+            child: Center(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Text(widget.mode == 'people' ? '👥' : '🔨',
+                      style: const TextStyle(fontSize: 48)),
+                  const SizedBox(height: 16),
+                  Text(
+                      widget.mode == 'people'
+                          ? 'No one to swipe right now'
+                          : 'No jobs to swipe right now',
+                      style: const TextStyle(
+                          color: Color(0xFFF0F4FF),
+                          fontSize: 20,
+                          fontWeight: FontWeight.w700)),
+                  const SizedBox(height: 8),
+                  const Text('Try widening your filters or check back later',
+                      style: TextStyle(color: Color(0xFF8896b0)),
+                      textAlign: TextAlign.center),
+                  const SizedBox(height: 24),
+                  ElevatedButton.icon(
+                    onPressed: _showFilters,
+                    icon: const Icon(Icons.tune, size: 18),
+                    label: const Text('ADJUST FILTERS'),
+                  ),
+                ],
+              ),
+            ),
           ),
         ],
       ),
@@ -593,59 +649,65 @@ class _SwipeScreenState extends State<SwipeScreen> {
   }
 
   Widget _buildSwiper() {
-    return Column(
-      children: [
-        Padding(
-          padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
-          child: Row(
-            children: [
-              _filterChip(Icons.location_on, '${_radiusKm.round()} km'),
-              const SizedBox(width: 6),
-              if (_experienceFilter != 'All')
-                _filterChip(Icons.work, _experienceFilter),
-              if (_experienceFilter != 'All') const SizedBox(width: 6),
-              if (_tradeFilter != 'All')
-                _filterChip(Icons.build, _tradeFilter),
-              const Spacer(),
-              Text('${_cards.length}',
-                  style: const TextStyle(
-                      color: Color(0xFFFF6B35),
-                      fontSize: 14,
-                      fontWeight: FontWeight.w700)),
-            ],
-          ),
-        ),
-        Expanded(
-          child: Padding(
-            padding: const EdgeInsets.all(16),
-            child: AppinioSwiper(
-              controller: _swiperController,
-              cardCount: _cards.length,
-              swipeOptions: const SwipeOptions.symmetric(horizontal: true),
-              onSwipeEnd: _onSwipeEnd,
-              onEnd: () {
-                if (mounted) {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(
-                      content: Text('No more cards! Refreshing...'),
-                      backgroundColor: Color(0xFFFF6B35),
-                    ),
-                  );
-                  _loadCards();
-                }
-              },
-              cardBuilder: (context, index) {
-                if (widget.mode == 'people') {
-                  return _buildPersonCard(_cards[index]);
-                }
-                return _buildJobCard(_cards[index]);
-              },
+    return RefreshIndicator(
+      onRefresh: _loadCards,
+      color: const Color(0xFFFF6B35),
+      backgroundColor: const Color(0xFF111827),
+      notificationPredicate: (notification) => notification.depth == 0,
+      child: Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+            child: Row(
+              children: [
+                _filterChip(Icons.location_on, '${_radiusKm.round()} km'),
+                const SizedBox(width: 6),
+                if (_experienceFilter != 'All')
+                  _filterChip(Icons.work, _experienceFilter),
+                if (_experienceFilter != 'All') const SizedBox(width: 6),
+                if (_tradeFilter != 'All')
+                  _filterChip(Icons.build, _tradeFilter),
+                const Spacer(),
+                Text('${_cards.length}',
+                    style: const TextStyle(
+                        color: Color(0xFFFF6B35),
+                        fontSize: 14,
+                        fontWeight: FontWeight.w700)),
+              ],
             ),
           ),
-        ),
-        _buildActionButtons(),
-        const SizedBox(height: 8),
-      ],
+          Expanded(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: AppinioSwiper(
+                controller: _swiperController,
+                cardCount: _cards.length,
+                swipeOptions: const SwipeOptions.symmetric(horizontal: true),
+                onSwipeEnd: _onSwipeEnd,
+                onEnd: () {
+                  if (mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(
+                        content: Text('No more cards! Refreshing...'),
+                        backgroundColor: Color(0xFFFF6B35),
+                      ),
+                    );
+                    _loadCards();
+                  }
+                },
+                cardBuilder: (context, index) {
+                  if (widget.mode == 'people') {
+                    return _buildPersonCard(_cards[index]);
+                  }
+                  return _buildJobCard(_cards[index]);
+                },
+              ),
+            ),
+          ),
+          _buildActionButtons(),
+          const SizedBox(height: 8),
+        ],
+      ),
     );
   }
 
@@ -676,6 +738,7 @@ class _SwipeScreenState extends State<SwipeScreen> {
     final user = card['user'] as Map<String, dynamic>;
     final profile = card['profile'] as Map<String, dynamic>;
     final distanceKm = card['distance_km'] as double?;
+    final avgRating = card['avg_rating'] as double?;
     final name = profile['full_name'] ?? user['email'] ?? 'Unknown';
     final role = user['role'] ?? '';
     final experience = profile['experience_level'] ?? '';
@@ -684,6 +747,7 @@ class _SwipeScreenState extends State<SwipeScreen> {
     final years = profile['years_in_field'] ?? 0;
     final bio = profile['bio'] ?? '';
     final photoUrl = profile['profile_photo_url'];
+    final availability = profile['availability_status']?.toString();
     final interested = _interestedInMeIds.contains(user['id']);
 
     return GestureDetector(
@@ -776,32 +840,53 @@ class _SwipeScreenState extends State<SwipeScreen> {
                       ),
                     ),
                   ),
-                if (distanceKm != null)
-                  Positioned(
-                    top: 12,
-                    right: 12,
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 8, vertical: 4),
-                      decoration: BoxDecoration(
-                        color: Colors.black.withOpacity(0.6),
-                        borderRadius: BorderRadius.circular(4),
-                      ),
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          const Icon(Icons.location_on,
-                              color: Colors.white, size: 12),
-                          const SizedBox(width: 3),
-                          Text('${distanceKm.round()} km',
+                Positioned(
+                  top: 12,
+                  right: 12,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.end,
+                    children: [
+                      if (distanceKm != null)
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 8, vertical: 4),
+                          decoration: BoxDecoration(
+                            color: Colors.black.withOpacity(0.6),
+                            borderRadius: BorderRadius.circular(4),
+                          ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              const Icon(Icons.location_on,
+                                  color: Colors.white, size: 12),
+                              const SizedBox(width: 3),
+                              Text('${distanceKm.round()} km',
+                                  style: const TextStyle(
+                                      color: Colors.white,
+                                      fontSize: 11,
+                                      fontWeight: FontWeight.w700)),
+                            ],
+                          ),
+                        ),
+                      if (avgRating != null) ...[
+                        if (distanceKm != null) const SizedBox(height: 6),
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 8, vertical: 4),
+                          decoration: BoxDecoration(
+                            color: Colors.black.withOpacity(0.6),
+                            borderRadius: BorderRadius.circular(4),
+                          ),
+                          child: Text('⭐ ${avgRating.toStringAsFixed(1)}',
                               style: const TextStyle(
                                   color: Colors.white,
                                   fontSize: 11,
                                   fontWeight: FontWeight.w700)),
-                        ],
-                      ),
-                    ),
+                        ),
+                      ],
+                    ],
                   ),
+                ),
               ]),
               Expanded(
                 child: Padding(
@@ -856,6 +941,22 @@ class _SwipeScreenState extends State<SwipeScreen> {
                           if (tradeType.toString().isNotEmpty)
                             _chip(tradeType, const Color(0xFF1a2235),
                                 const Color(0xFF8896b0)),
+                          if (availability != null &&
+                              availability.isNotEmpty &&
+                              CrewConstants.availabilityShortLabel(availability)
+                                  .isNotEmpty)
+                            _chip(
+                                CrewConstants
+                                    .availabilityShortLabel(availability),
+                                CrewConstants.availabilityColor(availability)
+                                    .withOpacity(0.18),
+                                CrewConstants
+                                    .availabilityColor(availability)),
+                          if (avgRating != null)
+                            _chip(
+                                '⭐ ${avgRating.toStringAsFixed(1)}',
+                                const Color(0xFF1a2235),
+                                const Color(0xFFfbbf24)),
                         ],
                       ),
                       if (location.toString().isNotEmpty) ...[
@@ -920,20 +1021,7 @@ class _SwipeScreenState extends State<SwipeScreen> {
         rate is num ? rate.toDouble() : double.tryParse('$rate') ?? 0;
     final isHighPay = rateValue >= 50;
 
-    String expLabel = experience;
-    switch (experience) {
-      case 'any':
-        expLabel = 'Any Level';
-        break;
-      case 'apprentice':
-        expLabel = 'Apprentice';
-        break;
-      case 'journeyman':
-        expLabel = 'Journeyman';
-        break;
-      default:
-        expLabel = CrewConstants.expToLabel(experience);
-    }
+    final expLabel = CrewConstants.expToLabel(experience.toString());
 
     return GestureDetector(
       onTap: () => Navigator.push(
@@ -1226,4 +1314,3 @@ class _SwipeScreenState extends State<SwipeScreen> {
     );
   }
 }
-
