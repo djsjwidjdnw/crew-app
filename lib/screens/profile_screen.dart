@@ -59,6 +59,8 @@ class _ProfileScreenState extends State<ProfileScreen> {
   int _myRatingCount = 0;
   final Set<String> _ratedMatchIds = {};
 
+  bool _deletingAccount = false;
+
   final _picker = ImagePicker();
 
   @override
@@ -685,6 +687,162 @@ class _ProfileScreenState extends State<ProfileScreen> {
     }
   }
 
+  // --------------------------------------------------------------------------
+  // Account deletion (App Store guideline 5.1.1(v)). The server side is the
+  // delete_my_account() function in supabase/migrations/002_delete_my_account.sql.
+  // --------------------------------------------------------------------------
+  Future<void> _confirmDeleteAccount() async {
+    final controller = TextEditingController();
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setD) {
+          final typed = controller.text.trim() == 'DELETE';
+          return AlertDialog(
+            backgroundColor: CrewConstants.surface,
+            title: const Text('Delete account?',
+                style: TextStyle(color: CrewConstants.textPrimary, fontSize: 18)),
+            content: Column(mainAxisSize: MainAxisSize.min, children: [
+              const Text(
+                  'This permanently deletes your account, profile, photos, '
+                  'certifications, matches, messages, endorsements, ratings '
+                  'and any jobs you posted. It cannot be undone.',
+                  style: TextStyle(
+                      color: CrewConstants.textSecondary, fontSize: 13)),
+              const SizedBox(height: 12),
+              const Align(
+                  alignment: Alignment.centerLeft,
+                  child: Text('Type DELETE to confirm.',
+                      style: TextStyle(
+                          color: CrewConstants.textPrimary, fontSize: 13))),
+              const SizedBox(height: 8),
+              TextField(
+                  controller: controller,
+                  autofocus: true,
+                  autocorrect: false,
+                  enableSuggestions: false,
+                  textCapitalization: TextCapitalization.characters,
+                  style: const TextStyle(color: CrewConstants.textPrimary),
+                  decoration: const InputDecoration(hintText: 'DELETE'),
+                  onChanged: (_) => setD(() {})),
+            ]),
+            actions: [
+              TextButton(
+                  onPressed: () => Navigator.pop(ctx, false),
+                  child: const Text('CANCEL',
+                      style: TextStyle(color: CrewConstants.textSecondary))),
+              TextButton(
+                  onPressed: typed ? () => Navigator.pop(ctx, true) : null,
+                  child: Text('DELETE ACCOUNT',
+                      style: TextStyle(
+                          color: typed
+                              ? CrewConstants.danger
+                              : CrewConstants.textSecondary))),
+            ],
+          );
+        },
+      ),
+    );
+    if (confirmed == true) await _deleteAccount();
+  }
+
+  Future<void> _deleteAccount() async {
+    setState(() => _deletingAccount = true);
+    final messenger = ScaffoldMessenger.of(context);
+    final photos = _myPhotoPaths();
+    try {
+      await _client.rpc('delete_my_account');
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _deletingAccount = false);
+      // PGRST202: PostgREST can't find the function (migration not applied yet).
+      final notSetUp = e is PostgrestException &&
+          (e.code == 'PGRST202' ||
+              e.code == '42883' ||
+              e.message.contains('Could not find the function'));
+      _showDeleteAccountInfo(notSetUp
+          ? 'Account deletion is being set up. Email support@crewapp.ca to delete your account.'
+          : 'Could not delete your account. Check your connection and try again, or email support@crewapp.ca.');
+      return;
+    }
+
+    // The account is gone server-side. Best-effort: remove the photo files it
+    // uploaded while the session token is still valid.
+    await _removePhotos(photos);
+    try {
+      await _client.auth.signOut();
+    } catch (_) {
+      // The user no longer exists, so the server call may fail; the local
+      // session is cleared regardless.
+    }
+    messenger.showSnackBar(const SnackBar(
+      content: Text('Your account has been deleted.'),
+      backgroundColor: CrewConstants.success,
+      behavior: SnackBarBehavior.floating,
+    ));
+    // The auth listener in main.dart normally routes to /login on sign-out;
+    // this covers the case where it didn't.
+    if (!mounted) return;
+    Navigator.of(context).pushNamedAndRemoveUntil('/login', (route) => false);
+  }
+
+  void _showDeleteAccountInfo(String message) {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: CrewConstants.surface,
+        title: const Text('Delete account',
+            style: TextStyle(color: CrewConstants.textPrimary, fontSize: 18)),
+        content: Text(message,
+            style: const TextStyle(color: CrewConstants.textSecondary)),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('OK',
+                  style: TextStyle(color: CrewConstants.primary))),
+        ],
+      ),
+    );
+  }
+
+  /// Storage paths of the photos this user uploaded (profile photo and
+  /// certification photos), keyed by bucket, parsed from their public URLs.
+  Map<String, List<String>> _myPhotoPaths() {
+    final paths = <String, List<String>>{
+      'profile-photos': [],
+      'certifications': [],
+    };
+    void add(Object? url) {
+      final s = url?.toString() ?? '';
+      for (final bucket in paths.keys) {
+        final marker = '/object/public/$bucket/';
+        final i = s.indexOf(marker);
+        if (i != -1) {
+          paths[bucket]!.add(Uri.decodeComponent(
+              s.substring(i + marker.length).split('?').first));
+        }
+      }
+    }
+
+    add(_profile?['profile_photo_url']);
+    for (final c in _certifications) {
+      add(c['photo_url']);
+    }
+    return paths;
+  }
+
+  Future<void> _removePhotos(Map<String, List<String>> paths) async {
+    try {
+      await Future.wait([
+        for (final e in paths.entries)
+          if (e.value.isNotEmpty) _client.storage.from(e.key).remove(e.value),
+      ]).timeout(const Duration(seconds: 10));
+    } catch (_) {
+      // Best-effort: storage policies may not allow it. The account and all
+      // database rows are already deleted at this point.
+    }
+  }
+
   @override
   void dispose() {
     _nameController.dispose();
@@ -903,6 +1061,24 @@ class _ProfileScreenState extends State<ProfileScreen> {
                   : _crewHistory.map(_buildCrewHistoryItem).toList()),
           const SizedBox(height: 12),
           _buildCertificationsCard(),
+          const SizedBox(height: 32),
+          SizedBox(
+              width: double.infinity,
+              child: OutlinedButton.icon(
+                  onPressed: _deletingAccount ? null : _confirmDeleteAccount,
+                  icon: _deletingAccount
+                      ? const SizedBox(
+                          width: 16,
+                          height: 16,
+                          child: CircularProgressIndicator(
+                              strokeWidth: 2, color: CrewConstants.danger))
+                      : const Icon(Icons.delete_forever, size: 18),
+                  label: const Text('Delete account',
+                      style: TextStyle(fontSize: 13)),
+                  style: OutlinedButton.styleFrom(
+                      foregroundColor: CrewConstants.danger,
+                      side: const BorderSide(color: CrewConstants.danger),
+                      minimumSize: const Size(double.infinity, 44)))),
           const SizedBox(height: 32),
         ]),
       ),
