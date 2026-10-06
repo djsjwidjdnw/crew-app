@@ -323,7 +323,7 @@ class _SwipeScreenState extends State<SwipeScreen> {
       final res = await _supabase
           .from('jobs')
           .select(
-              'id, title, description, location_text, hourly_rate, experience_required, duration_days, journeyman_id, trade_type, start_date, urgent, is_active, latitude, longitude, created_at')
+              'id, title, description, location_text, hourly_rate, experience_required, duration_days, journeyman_id, trade_type, start_date, is_active, latitude, longitude, created_at')
           .eq('is_active', true)
           .neq('journeyman_id', _userId!)
           .order('created_at', ascending: false)
